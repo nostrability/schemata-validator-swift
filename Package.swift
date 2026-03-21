@@ -8,12 +8,14 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/nostrability/schemata-swift.git", branch: "main"),
+        .package(url: "https://github.com/kylef/JSONSchema.swift.git", branch: "master"),
     ],
     targets: [
         .target(
             name: "SchemataValidator",
             dependencies: [
                 .product(name: "SchemataSwift", package: "schemata-swift"),
+                .product(name: "JSONSchema", package: "JSONSchema.swift"),
             ]
         ),
         .testTarget(

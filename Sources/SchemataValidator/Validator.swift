@@ -1,11 +1,11 @@
 import Foundation
 import SchemataSwift
+import JSONSchema
 
-/// Nostr JSON schema validator following schemata-validator-rs patterns.
+/// Nostr JSON schema validator using kylef/JSONSchema.swift for full draft-07 validation.
 ///
-/// Note: Swift lacks a mature draft-07 JSON Schema validation library.
-/// This implementation performs basic structural validation (const, required).
-/// Full draft-07 validation is planned when a suitable Swift library emerges.
+/// Supports allOf, anyOf, oneOf, contains, if/then/else, $ref,
+/// const, pattern, additionalProperties, and all other draft-07 keywords.
 public struct SchemataValidator {
 
     /// Validate a Nostr event by looking up kind{N}Schema.
@@ -24,7 +24,7 @@ public struct SchemataValidator {
                 warnings: [ValidationError(keyword: "note", message: "No schema found for kind \(kind)")]
             )
         }
-        return basicValidate(schema: schema, data: event)
+        return runValidation(schema: schema, data: event)
     }
 
     /// Validate a NIP-11 relay information document.
@@ -35,10 +35,10 @@ public struct SchemataValidator {
                 errors: [ValidationError(keyword: "nip11", message: "nip11Schema not found")]
             )
         }
-        return basicValidate(schema: schema, data: doc)
+        return runValidation(schema: schema, data: doc)
     }
 
-    /// Validate a protocol message.
+    /// Validate a protocol message (may be an array or object).
     public static func validateMessage(_ msg: Any, subject: Subject, slug: String) -> ValidationResult {
         let cap = slug.prefix(1).uppercased() + slug.dropFirst().lowercased()
         let key = "\(subject.description)\(cap)Schema"
@@ -48,11 +48,7 @@ public struct SchemataValidator {
                 warnings: [ValidationError(keyword: "message", message: "No schema found for \(subject.description) \(slug)")]
             )
         }
-        guard let data = msg as? [String: Any] ?? (msg as? [Any]).flatMap({ _ in nil as [String: Any]? }) else {
-            // For array messages, just check schema exists
-            return ValidationResult(valid: true)
-        }
-        return basicValidate(schema: schema, data: data)
+        return runValidation(schema: schema, data: msg)
     }
 
     /// Look up a schema by key.
@@ -60,48 +56,133 @@ public struct SchemataValidator {
         return Schemata.get(key)
     }
 
-    /// Basic structural validation checking const and required constraints.
-    private static func basicValidate(schema: [String: Any], data: [String: Any]) -> ValidationResult {
-        var errors: [ValidationError] = []
+    // MARK: - Private
 
+    /// Run full draft-07 JSON Schema validation using JSONSchema.swift.
+    ///
+    /// Strips nested `$id` and nested `$schema` from subschemas to prevent
+    /// the library from attempting remote resolution or re-selecting validators.
+    /// The root-level `$schema` is preserved for draft detection.
+    private static func runValidation(schema: [String: Any], data: Any) -> ValidationResult {
+        let cleaned = stripNestedMetaKeys(schema)
+
+        let jsResult: JSONSchema.ValidationResult
+        do {
+            jsResult = try JSONSchema.validate(data, schema: cleaned)
+        } catch {
+            return ValidationResult(
+                valid: false,
+                errors: [ValidationError(keyword: "schema", message: "Schema validation error: \(error.localizedDescription)")]
+            )
+        }
+
+        if jsResult.valid {
+            // Collect additional-property warnings from the schema
+            let warnings = collectAdditionalPropertyWarnings(schema: cleaned, data: data)
+            return ValidationResult(valid: true, warnings: warnings)
+        }
+
+        let errors: [ValidationError] = (jsResult.errors ?? []).map { jsErr in
+            ValidationError(
+                instancePath: jsErr.instanceLocation.path,
+                keyword: extractKeyword(from: jsErr.keywordLocation.path),
+                message: jsErr.description,
+                schemaPath: jsErr.keywordLocation.path
+            )
+        }
+        return ValidationResult(valid: false, errors: errors)
+    }
+
+    /// Recursively strip `$id` and `$schema` from nested sub-schemas,
+    /// preserving only the root-level `$schema` for draft selection.
+    private static func stripNestedMetaKeys(_ schema: [String: Any]) -> [String: Any] {
+        var result: [String: Any] = [:]
+        for (key, value) in schema {
+            if let dict = value as? [String: Any] {
+                result[key] = stripAllMetaKeys(dict)
+            } else if let arr = value as? [[String: Any]] {
+                result[key] = arr.map { stripAllMetaKeys($0) }
+            } else if let arr = value as? [Any] {
+                result[key] = arr.map { item -> Any in
+                    if let dict = item as? [String: Any] {
+                        return stripAllMetaKeys(dict)
+                    }
+                    return item
+                }
+            } else {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    /// Strip `$id` and `$schema` from a dictionary and all its descendants.
+    private static func stripAllMetaKeys(_ dict: [String: Any]) -> [String: Any] {
+        var result: [String: Any] = [:]
+        for (key, value) in dict {
+            if key == "$id" || key == "$schema" { continue }
+            if let nested = value as? [String: Any] {
+                result[key] = stripAllMetaKeys(nested)
+            } else if let arr = value as? [[String: Any]] {
+                result[key] = arr.map { stripAllMetaKeys($0) }
+            } else if let arr = value as? [Any] {
+                result[key] = arr.map { item -> Any in
+                    if let nested = item as? [String: Any] {
+                        return stripAllMetaKeys(nested)
+                    }
+                    return item
+                }
+            } else {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    /// Extract the keyword from a JSON Pointer path (last component).
+    private static func extractKeyword(from path: String) -> String {
+        let components = path.split(separator: "/")
+        return components.last.map(String.init) ?? ""
+    }
+
+    /// Walk the schema to find properties with additionalProperties and
+    /// report any extra keys in the data as warnings (not errors).
+    private static func collectAdditionalPropertyWarnings(schema: [String: Any], data: Any) -> [ValidationError] {
+        var warnings: [ValidationError] = []
+
+        guard let dataObj = data as? [String: Any] else { return warnings }
+
+        // Collect all declared property names from allOf sub-schemas
+        var declaredProps = Set<String>()
+        if let props = schema["properties"] as? [String: Any] {
+            declaredProps.formUnion(props.keys)
+        }
         if let allOf = schema["allOf"] as? [[String: Any]] {
             for sub in allOf {
-                if let properties = sub["properties"] as? [String: Any] {
-                    for (propName, propSchema) in properties {
-                        if let constraint = propSchema as? [String: Any],
-                           let constValue = constraint["const"] {
-                            let actual = data[propName]
-                            if !valuesEqual(actual, constValue) {
-                                errors.append(ValidationError(
-                                    keyword: "const",
-                                    message: "\(propName) must equal \(constValue)"
-                                ))
-                            }
-                        }
-                    }
+                if let props = sub["properties"] as? [String: Any] {
+                    declaredProps.formUnion(props.keys)
                 }
-                if let required = sub["required"] as? [String] {
-                    for field in required {
-                        if data[field] == nil {
-                            errors.append(ValidationError(
-                                keyword: "required",
-                                message: "missing required field: \(field)"
-                            ))
+                // Recurse one level into nested allOf
+                if let nestedAllOf = sub["allOf"] as? [[String: Any]] {
+                    for nested in nestedAllOf {
+                        if let props = nested["properties"] as? [String: Any] {
+                            declaredProps.formUnion(props.keys)
                         }
                     }
                 }
             }
         }
 
-        return ValidationResult(valid: errors.isEmpty, errors: errors)
-    }
+        if !declaredProps.isEmpty {
+            for key in dataObj.keys where !declaredProps.contains(key) {
+                warnings.append(ValidationError(
+                    instancePath: "/\(key)",
+                    keyword: "additionalProperties",
+                    message: "additional property '\(key)' is not defined in the schema"
+                ))
+            }
+        }
 
-    private static func valuesEqual(_ a: Any?, _ b: Any?) -> Bool {
-        if a == nil && b == nil { return true }
-        guard let a = a, let b = b else { return false }
-        if let aInt = a as? Int, let bInt = b as? Int { return aInt == bInt }
-        if let aStr = a as? String, let bStr = b as? String { return aStr == bStr }
-        if let aDouble = a as? Double, let bDouble = b as? Double { return aDouble == bDouble }
-        return false
+        return warnings
     }
 }
