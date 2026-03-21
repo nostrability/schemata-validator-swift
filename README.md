@@ -1,5 +1,7 @@
 # SchemataValidator
 
+[![Test](https://github.com/nostrability/schemata-validator-swift/actions/workflows/test.yml/badge.svg)](https://github.com/nostrability/schemata-validator-swift/actions/workflows/test.yml)
+
 Swift validator for [Nostr](https://nostr.com/) protocol JSON schemas. Built on [`SchemataSwift`](https://github.com/nostrability/schemata-swift).
 
 ## When to use this
