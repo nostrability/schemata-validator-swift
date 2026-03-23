@@ -1,5 +1,4 @@
 import Foundation
-import SchemataSwift
 import JSONSchema
 
 /// Nostr JSON schema validator using kylef/JSONSchema.swift for full draft-07 validation.
