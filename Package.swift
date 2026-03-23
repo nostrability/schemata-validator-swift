@@ -15,7 +15,7 @@ let package = Package(
             dependencies: [
                 .product(name: "JSONSchema", package: "JSONSchema.swift"),
             ],
-            resources: [.copy("Resources")]
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "SchemataValidatorTests",
